@@ -37,6 +37,7 @@ export async function createBunSqliteAdapter(filePath) {
 
   return {
     driver: "bun:sqlite",
+    dialect: "sqlite",
     run(sql, params = []) {
       const r = prepare(sql).run(...params);
       return { changes: Number(r.changes ?? 0), lastInsertRowid: Number(r.lastInsertRowid ?? 0) };
@@ -48,10 +49,16 @@ export async function createBunSqliteAdapter(filePath) {
       return prepare(sql).all(...params);
     },
     exec(sql) { return db.exec(sql); },
-    transaction(fn) {
-      // bun:sqlite has db.transaction() API (similar to better-sqlite3)
-      const tx = db.transaction(fn);
-      return tx();
+    async transaction(fn) {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const result = await fn();
+        db.exec("COMMIT");
+        return result;
+      } catch (e) {
+        try { db.exec("ROLLBACK"); } catch {}
+        throw e;
+      }
     },
     checkpoint() { try { db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch {} },
     close() {

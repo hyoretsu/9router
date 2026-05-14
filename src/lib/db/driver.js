@@ -4,6 +4,33 @@ import { ensureDirs, DATA_FILE } from "./paths.js";
 if (!global._dbAdapter) global._dbAdapter = { instance: null, initPromise: null, logged: false };
 const state = global._dbAdapter;
 
+function detectRemoteDialect(url) {
+  if (!url) return null;
+  const lower = url.toLowerCase();
+  if (lower.startsWith("postgres://") || lower.startsWith("postgresql://")) return "postgresql";
+  if (lower.startsWith("mysql://") || lower.startsWith("mariadb://")) return "mysql";
+  return null;
+}
+
+async function tryRemoteDb(url) {
+  const dialect = detectRemoteDialect(url);
+  if (!dialect) return null;
+  try {
+    if (dialect === "postgresql") {
+      const { createPgAdapter } = await import("./adapters/pgAdapter.js");
+      return await createPgAdapter(url);
+    }
+    if (dialect === "mysql") {
+      const { createMysqlAdapter } = await import("./adapters/mysqlAdapter.js");
+      return await createMysqlAdapter(url);
+    }
+  } catch (e) {
+    console.error(`[DB] Remote DB (${dialect}) connection failed: ${e.message}`);
+    throw e;
+  }
+  return null;
+}
+
 async function tryBunSqlite() {
   // Bun runtime only — built-in, no install needed
   if (!process.versions.bun) return null;
@@ -53,10 +80,20 @@ async function trySqlJs() {
 }
 
 async function initAdapter() {
+  const dbUrl = process.env.DATABASE_URL;
+
+  // Remote DB takes priority when DATABASE_URL is set
+  if (dbUrl) {
+    const remote = await tryRemoteDb(dbUrl);
+    if (remote) {
+      const { runMigrationOnce } = await import("./migrate.js");
+      await runMigrationOnce(remote);
+      return remote;
+    }
+  }
+
+  // SQLite fallback chain
   ensureDirs();
-  // Order per runtime:
-  //   Bun:  bun:sqlite → sql.js
-  //   Node: better-sqlite3 → node:sqlite (≥22.5) → sql.js
   let adapter = await tryBunSqlite();
   if (!adapter) adapter = await tryBetterSqlite();
   if (!adapter) adapter = await tryNodeSqlite();
