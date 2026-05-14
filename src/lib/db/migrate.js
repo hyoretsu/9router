@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { LEGACY_FILES, DB_DIR, DATA_FILE } from "./paths.js";
+
+const MIGRATION_BATCH_SIZE = 500;
 import { TABLES, buildCreateTableSqlForDialect } from "./schema.js";
 import { MIGRATIONS, latestVersion } from "./migrations/index.js";
 import { getMetaSync, setMetaSync } from "./helpers/metaStore.js";
@@ -250,6 +252,7 @@ export async function runMigrationOnce(adapter) {
   }
 
   // 4. App version bump → backup data.sqlite (SQLite only)
+
   const oldVer = await getMetaSync(adapter, "appVersion", null);
   const newVer = getAppVersion();
   if (oldVer && oldVer !== newVer) {
@@ -265,4 +268,122 @@ export async function runMigrationOnce(adapter) {
     try { backupFile(DATA_FILE, backupDir); } catch {}
     pruneOldBackups();
   }
+}
+
+// ─── One-time SQLite → remote copy ───────────────────────────────────────
+export async function migrateFromLocalSqlite(localAdapter, remoteAdapter) {
+  const marker = await getMetaSync(remoteAdapter, "migratedFromLocal", null);
+  if (marker) return false;
+
+  const [remoteFresh, localFresh] = await Promise.all([
+    isFreshDb(remoteAdapter),
+    isFreshDb(localAdapter),
+  ]);
+
+  if (!remoteFresh) {
+    // Remote already has data — stamp marker so we never try again
+    await setMetaSync(remoteAdapter, "migratedFromLocal", "skipped:remote-not-empty");
+    return false;
+  }
+  if (localFresh) return false;
+
+  console.log("[DB][migrate] SQLite → remote: starting data copy...");
+  const t0 = Date.now();
+
+  // Phase 1: all tables except usageHistory (single transaction)
+  await remoteAdapter.transaction(async () => {
+    for (const row of await localAdapter.all(`SELECT id, data FROM settings`)) {
+      await remoteAdapter.run(
+        `INSERT INTO settings(id, data) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`,
+        [row.id, row.data]
+      );
+    }
+    for (const row of await localAdapter.all(`SELECT * FROM providerConnections`)) {
+      await remoteAdapter.run(
+        `INSERT INTO providerConnections(id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET provider=excluded.provider, authType=excluded.authType, name=excluded.name, email=excluded.email, priority=excluded.priority, isActive=excluded.isActive, data=excluded.data, updatedAt=excluded.updatedAt`,
+        [row.id, row.provider, row.authType, row.name, row.email, row.priority, row.isActive, row.data, row.createdAt, row.updatedAt]
+      );
+    }
+    for (const row of await localAdapter.all(`SELECT * FROM providerNodes`)) {
+      await remoteAdapter.run(
+        `INSERT INTO providerNodes(id, type, name, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET type=excluded.type, name=excluded.name, data=excluded.data, updatedAt=excluded.updatedAt`,
+        [row.id, row.type, row.name, row.data, row.createdAt, row.updatedAt]
+      );
+    }
+    for (const row of await localAdapter.all(`SELECT * FROM proxyPools`)) {
+      await remoteAdapter.run(
+        `INSERT INTO proxyPools(id, isActive, testStatus, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET isActive=excluded.isActive, testStatus=excluded.testStatus, data=excluded.data, updatedAt=excluded.updatedAt`,
+        [row.id, row.isActive, row.testStatus, row.data, row.createdAt, row.updatedAt]
+      );
+    }
+    for (const row of await localAdapter.all(`SELECT * FROM apiKeys`)) {
+      await remoteAdapter.run(
+        `INSERT INTO apiKeys(id, key, name, machineId, isActive, createdAt) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET key=excluded.key, name=excluded.name, machineId=excluded.machineId, isActive=excluded.isActive`,
+        [row.id, row.key, row.name, row.machineId, row.isActive, row.createdAt]
+      );
+    }
+    for (const row of await localAdapter.all(`SELECT * FROM combos`)) {
+      await remoteAdapter.run(
+        `INSERT INTO combos(id, name, kind, models, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, kind=excluded.kind, models=excluded.models, updatedAt=excluded.updatedAt`,
+        [row.id, row.name, row.kind, row.models, row.createdAt, row.updatedAt]
+      );
+    }
+    for (const row of await localAdapter.all(`SELECT scope, key, value FROM kv`)) {
+      await remoteAdapter.run(
+        `INSERT INTO kv(scope, key, value) VALUES(?, ?, ?) ON CONFLICT(scope, key) DO UPDATE SET value=excluded.value`,
+        [row.scope, row.key, row.value]
+      );
+    }
+    for (const row of await localAdapter.all(`SELECT dateKey, data FROM usageDaily`)) {
+      await remoteAdapter.run(
+        `INSERT INTO usageDaily(dateKey, data) VALUES(?, ?) ON CONFLICT(dateKey) DO UPDATE SET data=excluded.data`,
+        [row.dateKey, row.data]
+      );
+    }
+    for (const row of await localAdapter.all(`SELECT * FROM requestDetails`)) {
+      await remoteAdapter.run(
+        `INSERT INTO requestDetails(id, timestamp, provider, model, connectionId, status, data) VALUES(?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET timestamp=excluded.timestamp, status=excluded.status, data=excluded.data`,
+        [row.id, row.timestamp, row.provider, row.model, row.connectionId, row.status, row.data]
+      );
+    }
+    // _meta: skip schemaVersion/appVersion (already stamped by runMigrationOnce)
+    for (const row of await localAdapter.all(`SELECT key, value FROM _meta WHERE key NOT IN ('schemaVersion', 'appVersion')`)) {
+      await remoteAdapter.run(
+        `INSERT INTO _meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+        [row.key, row.value]
+      );
+    }
+  });
+
+  // Phase 2: usageHistory in batches (auto-increment id — don't copy source id)
+  const countRow = await localAdapter.get(`SELECT COUNT(*) as c FROM usageHistory`);
+  const total = countRow ? parseInt(String(countRow.c), 10) : 0;
+
+  if (total > 0) {
+    let offset = 0;
+    while (offset < total) {
+      const batch = await localAdapter.all(
+        `SELECT timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, tokens, meta FROM usageHistory ORDER BY id ASC LIMIT ? OFFSET ?`,
+        [MIGRATION_BATCH_SIZE, offset]
+      );
+      if (!batch.length) break;
+      await remoteAdapter.transaction(async () => {
+        for (const row of batch) {
+          await remoteAdapter.run(
+            `INSERT INTO usageHistory(timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, tokens, meta) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [row.timestamp, row.provider, row.model, row.connectionId, row.apiKey, row.endpoint, row.promptTokens, row.completionTokens, row.cost, row.status, row.tokens, row.meta]
+          );
+        }
+      });
+      offset += batch.length;
+      if (total > MIGRATION_BATCH_SIZE) {
+        process.stdout.write(`\r[DB][migrate] usageHistory: ${offset}/${total}`);
+      }
+    }
+    if (total > MIGRATION_BATCH_SIZE) process.stdout.write("\n");
+  }
+
+  await setMetaSync(remoteAdapter, "migratedFromLocal", new Date().toISOString());
+  console.log(`[DB][migrate] SQLite → remote: done in ${Date.now() - t0}ms (${total} usage rows)`);
+  return true;
 }

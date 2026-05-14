@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { ensureDirs, DATA_FILE } from "./paths.js";
 
 // Use global to survive Next.js dev hot-reload (module state resets on reload)
@@ -86,8 +87,21 @@ async function initAdapter() {
   if (dbUrl) {
     const remote = await tryRemoteDb(dbUrl);
     if (remote) {
-      const { runMigrationOnce } = await import("./migrate.js");
+      const { runMigrationOnce, migrateFromLocalSqlite } = await import("./migrate.js");
       await runMigrationOnce(remote);
+
+      // One-time: copy local SQLite → remote when remote is fresh and local file exists
+      if (fs.existsSync(DATA_FILE)) {
+        const localSqlite = await tryBunSqlite() || await tryBetterSqlite() || await tryNodeSqlite() || await trySqlJs();
+        if (localSqlite) {
+          try {
+            await migrateFromLocalSqlite(localSqlite, remote);
+          } catch (e) {
+            console.warn(`[DB][migrate] Local → remote copy failed: ${e.message}`);
+          }
+        }
+      }
+
       return remote;
     }
   }
