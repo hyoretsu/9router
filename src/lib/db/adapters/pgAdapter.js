@@ -1,8 +1,29 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { TABLES } from "../schema.js";
 
 // Per-async-context transaction client — allows nested repo calls inside a transaction
 // to use the same pg client without changing repo function signatures.
 const txStorage = new AsyncLocalStorage();
+
+// Camelcase column names that PG would fold to lowercase without quoting.
+const CAMEL_IDENTIFIERS = new Set(
+  Object.values(TABLES).flatMap((def) => Object.keys(def.columns).filter((k) => k !== k.toLowerCase()))
+);
+
+// Wraps camelCase identifiers in double quotes so PG preserves case.
+// Splits on already-quoted strings first to avoid double-quoting.
+function quoteIdentifiers(sql) {
+  const matches = sql.match(/"[^"]*"/g) || [];
+  const parts = sql.split(/"[^"]*"/);
+  const processed = parts.map((part) => {
+    let s = part;
+    for (const name of CAMEL_IDENTIFIERS) {
+      s = s.replace(new RegExp(`\\b${name}\\b`, "g"), `"${name}"`);
+    }
+    return s;
+  });
+  return processed.reduce((acc, p, i) => acc + p + (matches[i] || ""), "");
+}
 
 // Table → primary key columns (for INSERT OR REPLACE → upsert translation)
 const TABLE_PK = {
@@ -56,6 +77,9 @@ function translateSql(sql, params) {
   let i = 0;
   result = result.replace(/\?/g, () => `$${++i}`);
 
+  // Quote camelCase identifiers to preserve case
+  result = quoteIdentifiers(result);
+
   return { sql: result, params };
 }
 
@@ -67,9 +91,11 @@ function translateExecSql(sql) {
     .filter(Boolean)
     .filter((s) => !/^PRAGMA\b/i.test(s))
     .map((s) =>
-      s
-        .replace(/INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT/gi, "SERIAL PRIMARY KEY")
-        .replace(/\bAUTOINCREMENT\b/gi, "")
+      quoteIdentifiers(
+        s
+          .replace(/INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT/gi, "SERIAL PRIMARY KEY")
+          .replace(/\bAUTOINCREMENT\b/gi, "")
+      )
     );
 }
 
@@ -105,11 +131,11 @@ export async function createPgAdapter(connectionString) {
   }
 
   async function get(sql, params = []) {
-    // PRAGMA table_info → information_schema
+    // PRAGMA table_info → information_schema (lowercase table name: PG folds unquoted table names)
     const ti = sql.match(/^\s*PRAGMA\s+table_info\s*\(\s*(\w+)\s*\)\s*$/i);
     if (ti) {
       const client = await getClient();
-      const r = await queryWith(client, `SELECT column_name AS name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1`, [ti[1]]);
+      const r = await queryWith(client, `SELECT column_name AS name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1`, [ti[1].toLowerCase()]);
       return r.rows[0];
     }
     const { sql: t, params: p } = translateSql(sql, params);
@@ -120,11 +146,11 @@ export async function createPgAdapter(connectionString) {
   }
 
   async function all(sql, params = []) {
-    // PRAGMA table_info → information_schema
+    // PRAGMA table_info → information_schema (lowercase table name: PG folds unquoted table names)
     const ti = sql.match(/^\s*PRAGMA\s+table_info\s*\(\s*(\w+)\s*\)\s*$/i);
     if (ti) {
       const client = await getClient();
-      const r = await queryWith(client, `SELECT column_name AS name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1`, [ti[1]]);
+      const r = await queryWith(client, `SELECT column_name AS name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1`, [ti[1].toLowerCase()]);
       return r.rows;
     }
     const { sql: t, params: p } = translateSql(sql, params);
