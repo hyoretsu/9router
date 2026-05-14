@@ -66,10 +66,11 @@ async function syncSchemaFromTables(adapter) {
 
     // Diff columns (works for all dialects — adapters translate PRAGMA to info_schema)
     const existing = await adapter.all(`PRAGMA table_info(${tableName})`);
-    const existingNames = new Set(existing.map((r) => r.name));
+    // PG folds unquoted identifiers to lowercase; compare case-insensitively
+    const existingNames = new Set(existing.map((r) => r.name.toLowerCase()));
 
     for (const [colName, colDef] of Object.entries(def.columns)) {
-      if (!existingNames.has(colName)) {
+      if (!existingNames.has(colName.toLowerCase())) {
         // Strip PK/UNIQUE/AUTOINCREMENT — can't add those on existing tables
         let safeDef = colDef
           .replace(/PRIMARY KEY( AUTOINCREMENT)?/i, "")
@@ -270,22 +271,30 @@ export async function runMigrationOnce(adapter) {
   }
 }
 
+// Returns true if any user-data table has rows (excludes _meta which migrations populate)
+async function hasUserData(adapter) {
+  try {
+    for (const table of ["providerConnections", "providerNodes", "combos", "kv"]) {
+      const row = await adapter.get(`SELECT 1 FROM ${table} LIMIT 1`);
+      if (row) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 // ─── One-time SQLite → remote copy ───────────────────────────────────────
 export async function migrateFromLocalSqlite(localAdapter, remoteAdapter) {
   const marker = await getMetaSync(remoteAdapter, "migratedFromLocal", null);
-  if (marker) return false;
+  // Only respect a real ISO timestamp (successful migration); ignore stale "skipped:*" values
+  if (marker && /^\d{4}-\d{2}-\d{2}T/.test(marker)) return false;
 
-  const [remoteFresh, localFresh] = await Promise.all([
-    isFreshDb(remoteAdapter),
-    isFreshDb(localAdapter),
-  ]);
+  // Remote must have no user data (only schema + _meta from migrations is OK)
+  if (await hasUserData(remoteAdapter)) return false;
 
-  if (!remoteFresh) {
-    // Remote already has data — stamp marker so we never try again
-    await setMetaSync(remoteAdapter, "migratedFromLocal", "skipped:remote-not-empty");
-    return false;
-  }
-  if (localFresh) return false;
+  // Local must have user data worth migrating
+  if (!(await hasUserData(localAdapter))) return false;
 
   console.log("[DB][migrate] SQLite → remote: starting data copy...");
   const t0 = Date.now();
