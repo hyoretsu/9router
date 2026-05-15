@@ -15,6 +15,11 @@ const TABLE_PK = {
   requestDetails: ["id"],
 };
 
+// Backtick-quote MySQL reserved words used as column names in this schema.
+function quoteReserved(sql) {
+  return sql.replace(/(?<!`)\bkey\b(?!`)/g, "`key`");
+}
+
 function translateSql(sql) {
   if (!sql) return null;
   const trimmed = sql.trim();
@@ -23,8 +28,24 @@ function translateSql(sql) {
 
   let result = sql;
 
-  // INSERT OR REPLACE INTO → REPLACE INTO (MariaDB/MySQL equivalent)
-  result = result.replace(/INSERT\s+OR\s+REPLACE\s+INTO/gi, "REPLACE INTO");
+  // INSERT OR REPLACE INTO → INSERT ... ON DUPLICATE KEY UPDATE (true upsert semantics)
+  if (/INSERT\s+OR\s+REPLACE\s+INTO/i.test(result)) {
+    const match = result.match(
+      /INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/i
+    );
+    if (match) {
+      const table = match[1];
+      const cols = match[2].split(",").map((s) => s.trim());
+      const valsPart = match[3];
+      const pk = TABLE_PK[table];
+      const updateCols = pk ? cols.filter((c) => !pk.includes(c)) : cols;
+      let upsert = `INSERT INTO ${table}(${cols.join(", ")}) VALUES(${valsPart})`;
+      if (updateCols.length > 0) {
+        upsert += ` ON DUPLICATE KEY UPDATE ${updateCols.map((c) => `${c}=VALUES(${c})`).join(", ")}`;
+      }
+      result = upsert;
+    }
+  }
 
   // ON CONFLICT(...) DO UPDATE SET col=excluded.col → ON DUPLICATE KEY UPDATE col=VALUES(col)
   result = result.replace(
@@ -35,7 +56,7 @@ function translateSql(sql) {
     }
   );
 
-  return result;
+  return quoteReserved(result);
 }
 
 function translateExecSql(sql) {
@@ -58,7 +79,7 @@ function translateExecSql(sql) {
         .replace(/\b(scope|key)\s+TEXT\s+NOT\s+NULL\b/gi, "$1 VARCHAR(191) NOT NULL")
         .replace(/\bTEXT\s+NOT\s+NULL\b/gi, "MEDIUMTEXT NOT NULL")
         .replace(/\bTEXT\b/gi, "MEDIUMTEXT")
-    );
+    ).map(quoteReserved);
 }
 
 async function getConn() {

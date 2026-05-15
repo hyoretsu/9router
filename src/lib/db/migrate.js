@@ -1,14 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { LEGACY_FILES, DB_DIR, DATA_FILE } from "./paths.js";
-
-const MIGRATION_BATCH_SIZE = 500;
 import { TABLES, buildCreateTableSqlForDialect } from "./schema.js";
 import { MIGRATIONS, latestVersion } from "./migrations/index.js";
-import { getMetaSync, setMetaSync } from "./helpers/metaStore.js";
+import { getMetaWith, setMetaWith } from "./helpers/metaStore.js";
 import { makeBackupDir, backupFile, pruneOldBackups } from "./backup.js";
 import { getAppVersion } from "./version.js";
 import { stringifyJson } from "./helpers/jsonCol.js";
+
+const MIGRATION_BATCH_SIZE = 500;
 
 // Marker file: prevents re-importing legacy JSON when user wipes data.sqlite.
 const MIGRATED_MARKER = path.join(DB_DIR, ".migrated-from-json");
@@ -39,7 +39,7 @@ async function runVersionedMigrations(adapter) {
   // Bootstrap _meta first so we can read schemaVersion
   await adapter.exec(buildCreateTableSqlForDialect("_meta", TABLES._meta, dialect));
 
-  const current = parseInt(await getMetaSync(adapter, "schemaVersion", "0"), 10) || 0;
+  const current = parseInt(await getMetaWith(adapter, "schemaVersion", "0"), 10) || 0;
   const target = latestVersion();
   if (current >= target) return { applied: 0, from: current, to: current };
 
@@ -48,7 +48,7 @@ async function runVersionedMigrations(adapter) {
   for (const m of pending) {
     await adapter.transaction(async () => {
       await m.up(adapter);
-      await setMetaSync(adapter, "schemaVersion", m.version);
+      await setMetaWith(adapter, "schemaVersion", m.version);
     });
     lastApplied = m.version;
     console.log(`[DB][migrate] applied #${m.version} ${m.name}`);
@@ -180,7 +180,7 @@ async function importLegacyUsage(adapter, data) {
     await adapter.run(`INSERT OR REPLACE INTO usageDaily(dateKey, data) VALUES(?, ?)`, [dateKey, stringifyJson(day)]);
   }
   if (typeof data.totalRequestsLifetime === "number") {
-    await setMetaSync(adapter, "totalRequestsLifetime", data.totalRequestsLifetime);
+    await setMetaWith(adapter, "totalRequestsLifetime", data.totalRequestsLifetime);
   }
 }
 
@@ -236,8 +236,8 @@ export async function runMigrationOnce(adapter) {
         await importLegacyUsage(adapter, legacyUsage);
         await importLegacyDisabled(adapter, legacyDisabled);
         await importLegacyDetails(adapter, legacyDetails);
-        await setMetaSync(adapter, "appVersion", getAppVersion());
-        await setMetaSync(adapter, "migratedAt", new Date().toISOString());
+        await setMetaWith(adapter, "appVersion", getAppVersion());
+        await setMetaWith(adapter, "migratedAt", new Date().toISOString());
       });
 
       try { fs.writeFileSync(MIGRATED_MARKER, new Date().toISOString()); } catch {}
@@ -248,13 +248,13 @@ export async function runMigrationOnce(adapter) {
   }
 
   if (fresh) {
-    await setMetaSync(adapter, "appVersion", getAppVersion());
+    await setMetaWith(adapter, "appVersion", getAppVersion());
     return;
   }
 
   // 4. App version bump → backup data.sqlite (SQLite only)
 
-  const oldVer = await getMetaSync(adapter, "appVersion", null);
+  const oldVer = await getMetaWith(adapter, "appVersion", null);
   const newVer = getAppVersion();
   if (oldVer && oldVer !== newVer) {
     if (!isRemote) {
@@ -263,7 +263,7 @@ export async function runMigrationOnce(adapter) {
       pruneOldBackups();
       console.log(`[DB][migrate] App ${oldVer} → ${newVer} | schema ${migInfo.from} → ${migInfo.to} | backup: ${backupDir}`);
     }
-    await setMetaSync(adapter, "appVersion", newVer);
+    await setMetaWith(adapter, "appVersion", newVer);
   } else if (migInfo.applied > 0 && !isRemote) {
     const backupDir = makeBackupDir(`schema-${migInfo.from}-to-${migInfo.to}`);
     try { backupFile(DATA_FILE, backupDir); } catch {}
@@ -286,7 +286,7 @@ async function hasUserData(adapter) {
 
 // ─── One-time SQLite → remote copy ───────────────────────────────────────
 export async function migrateFromLocalSqlite(localAdapter, remoteAdapter) {
-  const marker = await getMetaSync(remoteAdapter, "migratedFromLocal", null);
+  const marker = await getMetaWith(remoteAdapter, "migratedFromLocal", null);
   // Only respect a real ISO timestamp (successful migration); ignore stale "skipped:*" values
   if (marker && /^\d{4}-\d{2}-\d{2}T/.test(marker)) return false;
 
@@ -364,35 +364,39 @@ export async function migrateFromLocalSqlite(localAdapter, remoteAdapter) {
     }
   });
 
-  // Phase 2: usageHistory in batches (auto-increment id — don't copy source id)
-  const countRow = await localAdapter.get(`SELECT COUNT(*) as c FROM usageHistory`);
+  // Phase 2: usageHistory in batches (cursor-based; resumable after partial failure)
+  // lastCopiedSourceId is persisted after each batch so a retry skips already-copied rows.
+  const wmRow = await getMetaWith(remoteAdapter, "migratedFromLocalUsageId", null);
+  let lastCopiedSourceId = wmRow ? parseInt(wmRow, 10) : 0;
+
+  const countRow = await localAdapter.get(`SELECT COUNT(*) as c FROM usageHistory WHERE id > ?`, [lastCopiedSourceId]);
   const total = countRow ? parseInt(String(countRow.c), 10) : 0;
+  let copied = 0;
 
-  if (total > 0) {
-    let offset = 0;
-    while (offset < total) {
-      const batch = await localAdapter.all(
-        `SELECT timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, tokens, meta FROM usageHistory ORDER BY id ASC LIMIT ? OFFSET ?`,
-        [MIGRATION_BATCH_SIZE, offset]
-      );
-      if (!batch.length) break;
-      await remoteAdapter.transaction(async () => {
-        for (const row of batch) {
-          await remoteAdapter.run(
-            `INSERT INTO usageHistory(timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, tokens, meta) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [row.timestamp, row.provider, row.model, row.connectionId, row.apiKey, row.endpoint, row.promptTokens, row.completionTokens, row.cost, row.status, row.tokens, row.meta]
-          );
-        }
-      });
-      offset += batch.length;
-      if (total > MIGRATION_BATCH_SIZE) {
-        process.stdout.write(`\r[DB][migrate] usageHistory: ${offset}/${total}`);
+  while (copied < total) {
+    const batch = await localAdapter.all(
+      `SELECT id, timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, tokens, meta FROM usageHistory WHERE id > ? ORDER BY id ASC LIMIT ?`,
+      [lastCopiedSourceId, MIGRATION_BATCH_SIZE]
+    );
+    if (!batch.length) break;
+    await remoteAdapter.transaction(async () => {
+      for (const row of batch) {
+        await remoteAdapter.run(
+          `INSERT INTO usageHistory(timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, tokens, meta) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [row.timestamp, row.provider, row.model, row.connectionId, row.apiKey, row.endpoint, row.promptTokens, row.completionTokens, row.cost, row.status, row.tokens, row.meta]
+        );
       }
+    });
+    lastCopiedSourceId = batch[batch.length - 1].id;
+    await setMetaWith(remoteAdapter, "migratedFromLocalUsageId", String(lastCopiedSourceId));
+    copied += batch.length;
+    if (total > MIGRATION_BATCH_SIZE) {
+      process.stdout.write(`\r[DB][migrate] usageHistory: ${copied}/${total}`);
     }
-    if (total > MIGRATION_BATCH_SIZE) process.stdout.write("\n");
   }
+  if (total > MIGRATION_BATCH_SIZE) process.stdout.write("\n");
 
-  await setMetaSync(remoteAdapter, "migratedFromLocal", new Date().toISOString());
+  await setMetaWith(remoteAdapter, "migratedFromLocal", new Date().toISOString());
   console.log(`[DB][migrate] SQLite → remote: done in ${Date.now() - t0}ms (${total} usage rows)`);
   return true;
 }

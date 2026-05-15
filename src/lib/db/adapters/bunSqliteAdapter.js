@@ -35,6 +35,9 @@ export async function createBunSqliteAdapter(filePath) {
   process.once("SIGINT", () => { onShutdown(); process.exit(0); });
   process.once("SIGTERM", () => { onShutdown(); process.exit(0); });
 
+  // Serialize async transactions: one connection, no concurrent BEGIN allowed.
+  let txQueue = Promise.resolve();
+
   return {
     driver: "bun:sqlite",
     dialect: "sqlite",
@@ -49,16 +52,21 @@ export async function createBunSqliteAdapter(filePath) {
       return prepare(sql).all(...params);
     },
     exec(sql) { return db.exec(sql); },
-    async transaction(fn) {
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        const result = await fn();
-        db.exec("COMMIT");
-        return result;
-      } catch (e) {
-        try { db.exec("ROLLBACK"); } catch {}
-        throw e;
-      }
+    transaction(fn) {
+      const runTx = async () => {
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          const result = await fn();
+          db.exec("COMMIT");
+          return result;
+        } catch (e) {
+          try { db.exec("ROLLBACK"); } catch {}
+          throw e;
+        }
+      };
+      const next = txQueue.then(runTx, runTx);
+      txQueue = next.then(() => {}, () => {});
+      return next;
     },
     checkpoint() { try { db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch {} },
     close() {

@@ -11,12 +11,12 @@ export async function setMeta(key, value) {
   await db.run(`INSERT INTO _meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [key, String(value)]);
 }
 
-// Async versions for use during migration (adapter passed directly)
-export async function getMetaSync(adapter, key, fallback = null) {
+// Adapter-explicit versions for use during migration (adapter passed directly)
+export async function getMetaWith(adapter, key, fallback = null) {
   const row = await adapter.get(`SELECT value FROM _meta WHERE key = ?`, [key]);
   return row ? row.value : fallback;
 }
 
-export async function setMetaSync(adapter, key, value) {
+export async function setMetaWith(adapter, key, value) {
   await adapter.run(`INSERT INTO _meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [key, String(value)]);
 }

@@ -11,10 +11,19 @@ const CAMEL_IDENTIFIERS = new Set(
 );
 
 // Wraps camelCase identifiers in double quotes so PG preserves case.
-// Splits on already-quoted strings first to avoid double-quoting.
+// Skips both double-quoted identifiers and single-quoted string literals.
 function quoteIdentifiers(sql) {
-  const matches = sql.match(/"[^"]*"/g) || [];
-  const parts = sql.split(/"[^"]*"/);
+  const TOKEN_RE = /"[^"]*"|'[^']*'/g;
+  const tokens = [];
+  const parts = [];
+  let lastIndex = 0;
+  let m;
+  while ((m = TOKEN_RE.exec(sql)) !== null) {
+    parts.push(sql.slice(lastIndex, m.index));
+    tokens.push(m[0]);
+    lastIndex = m.index + m[0].length;
+  }
+  parts.push(sql.slice(lastIndex));
   const processed = parts.map((part) => {
     let s = part;
     for (const name of CAMEL_IDENTIFIERS) {
@@ -22,7 +31,7 @@ function quoteIdentifiers(sql) {
     }
     return s;
   });
-  return processed.reduce((acc, p, i) => acc + p + (matches[i] || ""), "");
+  return processed.reduce((acc, p, i) => acc + p + (tokens[i] || ""), "");
 }
 
 // Table → primary key columns (for INSERT OR REPLACE → upsert translation)
